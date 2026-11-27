@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Мемофей — один файл, один процесс, Windows.
-Генерация мемов + AI-подписи через Groq (модель Llama 4 Scout).
-Калькулятор и Нейрофей удалены.
-Логи полностью отключены.
-Запуск: python h.py
-"""
+"""Memofey v8.0: мемы, AI-подписи (Groq), генерация картинок (Pollinations), HTTP keep-alive для Render."""
 from __future__ import annotations
 
 import asyncio
@@ -23,6 +17,7 @@ import uuid
 from collections import OrderedDict
 from functools import lru_cache
 from io import BytesIO
+from urllib.parse import quote
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -46,14 +41,9 @@ from telegram.ext import (
 
 logging.disable(logging.CRITICAL)
 
-# ---------------------------------------------------------------------------
-# Конфигурация
-# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-MEMO_TOKEN = os.getenv("BOT_TOKEN").strip()
+MEMO_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5877375975"))
-
 DATA_DIR = os.getenv("MEMOFEY_DIR", BASE_DIR).strip() or BASE_DIR
 USER_TEMPLATES_DIR = os.path.join(DATA_DIR, "user_templates")
 PREVIEW_DIR = os.path.join(USER_TEMPLATES_DIR, ".previews")
@@ -61,20 +51,21 @@ PHRASES_FILE = os.path.join(DATA_DIR, "custom_phrases.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 AI_MEMORY_FILE = os.path.join(DATA_DIR, "ai_memory.json")
 
-# --- Groq (вместо Ollama) -------------------------------------------------
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY"
-).strip()
+GROQ_API_KEY = ""
 GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
-GROQ_VISION_MODEL = os.getenv(
-    "GROQ_VISION_MODEL", "qwen/qwen3.8-27b"
-)
-
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b").strip()
 CONNECT_TIMEOUT = 15
-READ_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "600"))
+READ_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "120"))
+AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "400"))
 
-# Мемофей
-AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "300"))
+POLLINATIONS_IMAGE_URL = os.getenv("POLLINATIONS_IMAGE_URL", "https://image.pollinations.ai/prompt/").rstrip("/") + "/"
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "").strip()
+GEN_WIDTH = int(os.getenv("GEN_WIDTH", "1280"))
+GEN_HEIGHT = int(os.getenv("GEN_HEIGHT", "720"))
+GEN_READ_TIMEOUT = int(os.getenv("GEN_READ_TIMEOUT", "180"))
+GEN_MIN_INTERVAL = float(os.getenv("GEN_MIN_INTERVAL", "46"))
+GEN_PROMPT_MAX_LEN = 600
+
 JPEG_QUALITY = 88
 PREVIEW_QUALITY = 72
 PREVIEW_SIZE = 512
@@ -87,27 +78,35 @@ PAGE_SIZE = 10
 AI_MEMORIES_CAP = 500
 TOKEN_PATTERN = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,64}$")
 RESAMPLE = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+HTTP_HEADERS = {"User-Agent": "MemofeyBot/8.0"}
 
 
-# ---------------------------------------------------------------------------
-# Groq: запрос к vision-модели
-# ---------------------------------------------------------------------------
+def _retry_after_seconds(resp, default: float) -> float:
+    try:
+        return min(120.0, max(1.0, float(resp.headers.get("Retry-After", ""))))
+    except (TypeError, ValueError):
+        pass
+    try:
+        m = re.search(r"[Rr]etry after (\d+)", resp.text or "")
+        if m:
+            return min(120.0, max(1.0, float(m.group(1))))
+    except Exception:
+        pass
+    return default
+
+
 def _groq_vision_request(
     system_prompt: str,
     user_prompt: str,
     image_base64: str,
     temperature: float = 0.7,
 ) -> dict:
-    """
-    Отправляет запрос в Groq API с изображением (base64) и возвращает
-    словарь с ключами 'content' и 'error'.
-    """
     if not GROQ_API_KEY:
-        return {"content": "", "error": "no_key"}
-
+        return {"content": "", "error": "Не задан GROQ_API_KEY."}
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
+        **HTTP_HEADERS,
     }
     payload = {
         "model": GROQ_VISION_MODEL,
@@ -117,58 +116,144 @@ def _groq_vision_request(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": user_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_base64}"
-                        },
-                    },
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
                 ],
             },
         ],
         "temperature": temperature,
-        "max_tokens": AI_MAX_TOKENS,
+        "max_completion_tokens": AI_MAX_TOKENS,
+        "reasoning_effort": "none",
+        "reasoning_format": "hidden",
         "stream": False,
     }
-
+    last_error = "Неизвестная ошибка Groq."
     for attempt in range(3):
         try:
             resp = requests.post(
-                GROQ_API_URL,
-                headers=headers,
-                json=payload,
+                GROQ_API_URL, headers=headers, json=payload,
                 timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
             )
-            if resp.status_code == 429:  # rate limit
-                time.sleep(3 + attempt * 2)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            return {"content": content, "error": None}
         except requests.exceptions.RequestException as exc:
+            last_error = f"Сеть: {str(exc)[:150]}"
             if attempt < 2:
                 time.sleep(2.0)
                 continue
-            return {"content": "", "error": str(exc)[:200]}
-        except (KeyError, IndexError, ValueError):
-            return {"content": "", "error": "bad_response"}
+            return {"content": "", "error": last_error}
 
-    return {"content": "", "error": "retry_exhausted"}
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                content = (data["choices"][0]["message"].get("content") or "").strip()
+                if content:
+                    return {"content": content, "error": None}
+                last_error = "Groq вернул пустой ответ."
+            except (KeyError, IndexError, ValueError, TypeError):
+                last_error = "Groq вернул некорректный ответ."
+            if attempt < 2:
+                time.sleep(1.5)
+                continue
+            return {"content": "", "error": last_error}
+
+        try:
+            err = resp.json().get("error", {})
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+        except ValueError:
+            msg = resp.text[:150]
+        last_error = f"HTTP {resp.status_code}: {str(msg)[:180]}"
+
+        if resp.status_code == 429:
+            if attempt < 2:
+                time.sleep(_retry_after_seconds(resp, 3 + attempt * 3))
+                continue
+        elif resp.status_code in (401, 403):
+            return {"content": "", "error": last_error + " — проверь ключ GROQ_API_KEY (доступ отклонён)."}
+        elif resp.status_code == 400:
+            low = str(msg).lower()
+            if attempt == 0 and ("reasoning" in low or "max_completion_tokens" in low or "unsupported" in low or "unknown" in low):
+                payload.pop("reasoning_effort", None)
+                payload.pop("reasoning_format", None)
+                payload["max_tokens"] = payload.pop("max_completion_tokens", AI_MAX_TOKENS)
+                continue
+            if attempt < 2 and ("model" in low and ("decommission" in low or "not" in low or "exist" in low)):
+                payload["model"] = "meta-llama/llama-4-scout-17b-16e-instruct"
+                payload.pop("reasoning_effort", None)
+                payload.pop("reasoning_format", None)
+                continue
+            return {"content": "", "error": last_error}
+        elif resp.status_code >= 500:
+            if attempt < 2:
+                time.sleep(2.0 + attempt * 2)
+                continue
+        else:
+            return {"content": "", "error": last_error}
+    return {"content": "", "error": last_error}
 
 
-async def groq_vision_chat(
-    system_prompt: str, user_prompt: str, image_base64: str, temperature: float
-) -> dict:
-    """Асинхронная обёртка для вызова Groq из event loop."""
-    return await asyncio.to_thread(
-        _groq_vision_request, system_prompt, user_prompt, image_base64, temperature
+async def groq_vision_chat(system_prompt: str, user_prompt: str, image_base64: str, temperature: float) -> dict:
+    return await asyncio.to_thread(_groq_vision_request, system_prompt, user_prompt, image_base64, temperature)
+
+
+_GEN_LOCK = threading.Lock()
+_GEN_LAST_TS = 0.0
+
+
+def _pollinations_image_request(prompt: str) -> dict:
+    global _GEN_LAST_TS
+    prompt = " ".join(prompt.split())[:GEN_PROMPT_MAX_LEN]
+    if not prompt:
+        return {"data": None, "error": "Пустое описание."}
+    seed = random.randint(1, 2_000_000_000)
+    params = (
+        f"?width={GEN_WIDTH}&height={GEN_HEIGHT}&seed={seed}"
+        f"&nologo=true&private=true&safe=false&enhance=true"
     )
+    url = POLLINATIONS_IMAGE_URL + quote(prompt, safe="") + params
+    headers = dict(HTTP_HEADERS)
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+    last_error = "Неизвестная ошибка Pollinations."
+    with _GEN_LOCK:
+        for attempt in range(4):
+            wait = GEN_MIN_INTERVAL - (time.monotonic() - _GEN_LAST_TS)
+            if wait > 0:
+                time.sleep(wait)
+            _GEN_LAST_TS = time.monotonic()
+            try:
+                resp = requests.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, GEN_READ_TIMEOUT))
+            except requests.exceptions.RequestException as exc:
+                last_error = f"Сеть: {str(exc)[:150]}"
+                if attempt < 3:
+                    continue
+                return {"data": None, "error": last_error}
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if resp.status_code == 200 and ctype.startswith("image") and resp.content:
+                return {"data": resp.content, "error": None}
+            if resp.status_code in (402, 429, 503):
+                delay = _retry_after_seconds(resp, 15 + attempt * 10)
+                last_error = f"Лимит бесплатных запросов (HTTP {resp.status_code})."
+                if attempt < 3:
+                    time.sleep(min(delay, 90))
+                    continue
+                return {"data": None, "error": last_error + " Попробуй ещё раз через минуту."}
+            try:
+                err = resp.json().get("error", {})
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+            except ValueError:
+                msg = resp.text[:150]
+            last_error = f"HTTP {resp.status_code}: {str(msg)[:180]}"
+            if resp.status_code in (400, 422):
+                return {"data": None, "error": "Запрос отклонён фильтром сервиса. Измени описание."}
+            if attempt < 3 and resp.status_code >= 500:
+                time.sleep(3)
+                continue
+            return {"data": None, "error": last_error}
+    return {"data": None, "error": last_error}
 
 
-# ---------------------------------------------------------------------------
-# Хранилище
-# ---------------------------------------------------------------------------
+async def pollinations_generate(prompt: str) -> dict:
+    return await asyncio.to_thread(_pollinations_image_request, prompt)
+
+
 IO_LOCK = threading.RLock()
 PHRASE_LOCK = threading.RLock()
 USER_LOCK = threading.RLock()
@@ -225,9 +310,6 @@ def save_ai_memory(memory):
     save_json(AI_MEMORY_FILE, memory)
 
 
-# ---------------------------------------------------------------------------
-# Базовые фразы
-# ---------------------------------------------------------------------------
 BASE_TOP = [
     "Я: КОД РАБОТАЕТ", "ТЫ ПОСЛЕ ДЕБАГА", "СЕНЬОР СМОТРИТ ТВОЙ КОД",
     "Я: БЫСТРО ПОФИКШУ", "ДЕДЛАЙН ЧЕРЕЗ ЧАС", "ЗАКАЗЧИК МЕНЯЕТ ТЗ",
@@ -305,9 +387,6 @@ def delete_phrase_sync(kind: str, phrase: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Пользователи
-# ---------------------------------------------------------------------------
 _loaded_users = load_json(USERS_FILE, [])
 USERS: set[int] = (
     {int(x) for x in _loaded_users if isinstance(x, (int, str)) and str(x).lstrip("-").isdigit()}
@@ -344,13 +423,11 @@ async def track_user(user_id: int) -> None:
         await asyncio.to_thread(add_user_sync, user_id)
 
 
-# ---------------------------------------------------------------------------
-# Клавиатуры и тексты
-# ---------------------------------------------------------------------------
 EXIT_BUTTONS = {"◀️ Назад", "◀️ Выйти из поддержки", "◀️ Выйти из админки"}
 GROUP_ALLOWED_TEXTS = {
     "🎭 Шаблоны", "🖼 Выбрать шаблон", "📸 Загрузить", "✍️ Добавить фразу",
     "🆘 Техподдержка", "🎲 Случайная надпись", "✍️ Своя надпись", "🧠 Нейросеть",
+    "🎨 Сгенерировать картинку",
     "⬆️ Добавить верхнюю", "⬇️ Добавить нижнюю",
     "🛠 Админка", "🗑 Удалить шаблон", "🗑 Очистить всё", "🗑 Удалить фразу",
     "📊 Статистика", "📢 Рассылка",
@@ -359,7 +436,7 @@ GROUP_ALLOWED_TEXTS = {
 CAPTION_HELP = (
     "✍️ Своя надпись — пришли текст.\n"
     "Формат: ВЕРХ | НИЗ\n"
-    "Без «|» — текст будет снизу.\n\n"
+    "Без «|» — текст будет снизу.\n"
     "🎲 Случайная надпись — возьму из банка фраз.\n"
     "🧠 Нейросеть — ИИ посмотрит картинку и придумает сам."
 )
@@ -368,11 +445,11 @@ CAPTION_HELP = (
 def main_kb(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         ["🎭 Шаблоны", "🖼 Выбрать шаблон"],
-        ["📸 Загрузить", "✍️ Добавить фразу"],
-        ["🆘 Техподдержка"],
+        ["📸 Загрузить", "🎨 Сгенерировать картинку"],
+        ["✍️ Добавить фразу", "🆘 Техподдержка"],
     ]
     if user_id == ADMIN_ID:
-        rows[-1].append("🛠 Админка")
+        rows.append(["🛠 Админка"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -394,6 +471,7 @@ ADMIN_KB = ReplyKeyboardMarkup(
 )
 SUPPORT_KB = ReplyKeyboardMarkup([["◀️ Выйти из поддержки"]], resize_keyboard=True)
 UPLOAD_KB = ReplyKeyboardMarkup([["◀️ Назад"]], resize_keyboard=True)
+GEN_KB = ReplyKeyboardMarkup([["◀️ Назад"]], resize_keyboard=True)
 CONFIRM_KB = InlineKeyboardMarkup(
     [[
         InlineKeyboardButton("✅ Подтвердить", callback_data="confirm"),
@@ -402,9 +480,6 @@ CONFIRM_KB = InlineKeyboardMarkup(
 )
 
 
-# ---------------------------------------------------------------------------
-# Шаблоны
-# ---------------------------------------------------------------------------
 def setup_dirs() -> None:
     os.makedirs(USER_TEMPLATES_DIR, exist_ok=True)
     os.makedirs(PREVIEW_DIR, exist_ok=True)
@@ -498,9 +573,6 @@ def save_upload_sync(payload: bytes, owner_id: int) -> str:
     return final
 
 
-# ---------------------------------------------------------------------------
-# Отрисовка
-# ---------------------------------------------------------------------------
 _FONT_CANDIDATES = [
     "C:/Windows/Fonts/arialbd.ttf",
     "C:/Windows/Fonts/arial.ttf",
@@ -649,9 +721,6 @@ def parse_caption(text: str) -> tuple[str, str]:
     return "", normalize_phrase(text)[:400]
 
 
-# ---------------------------------------------------------------------------
-# Отправка мема
-# ---------------------------------------------------------------------------
 async def send_meme(
     context,
     chat_id: int,
@@ -667,7 +736,7 @@ async def send_meme(
         files = await asyncio.to_thread(list_templates)
         if not files:
             await context.bot.send_message(
-                chat_id, "❌ Нет шаблонов. Нажми «📸 Загрузить» и пришли картинку.",
+                chat_id, "❌ Нет шаблонов. Нажми «📸 Загрузить» или «🎨 Сгенерировать картинку».",
                 reply_markup=CAPTION_KB,
             )
             return
@@ -713,9 +782,6 @@ async def random_meme(context, chat_id: int, forced_path: str | None) -> None:
     await send_meme(context, chat_id, top, bottom, forced_path)
 
 
-# ---------------------------------------------------------------------------
-# Поддержка
-# ---------------------------------------------------------------------------
 ADMIN_REPLY_MAP: OrderedDict[int, int] = OrderedDict()
 
 
@@ -748,9 +814,6 @@ async def answer_support(context, message, chat_id: int) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Пагинация шаблонов
-# ---------------------------------------------------------------------------
 async def show_template_page(context, chat_id: int, mode: str, page: int, old_message_id: int | None = None) -> None:
     files = await asyncio.to_thread(list_templates)
     if not files:
@@ -813,9 +876,6 @@ async def show_template_page(context, chat_id: int, mode: str, page: int, old_me
     await context.bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(rows))
 
 
-# ---------------------------------------------------------------------------
-# Фразы: пагинация
-# ---------------------------------------------------------------------------
 def phrase_page_view(kind: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
     phrases = get_phrases(kind)
     pages = max(1, (len(phrases) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -856,9 +916,6 @@ async def send_phrase_menu(context, chat_id: int) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Рассылка
-# ---------------------------------------------------------------------------
 async def broadcast_worker(context, admin_chat: int, text: str) -> None:
     users = await asyncio.to_thread(users_snapshot)
     status = await context.bot.send_message(admin_chat, f"📢 Рассылка запущена. Получателей: {len(users)}")
@@ -920,9 +977,6 @@ def spawn_background(context, coro) -> None:
     task.add_done_callback(tasks.discard)
 
 
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
 class LRUDict(OrderedDict):
     def __init__(self, maxsize=10000):
         super().__init__()
@@ -984,9 +1038,6 @@ async def go_home(context, chat_id: int, user_id: int) -> None:
     await context.bot.send_message(chat_id, "🏠 Главное меню:", reply_markup=main_kb(user_id))
 
 
-# ---------------------------------------------------------------------------
-# Нейро-подписи для мемов (через Groq)
-# ---------------------------------------------------------------------------
 def _clean_ai_content(text: str) -> str:
     if not text:
         return ""
@@ -1072,6 +1123,7 @@ async def generate_ai_caption(image_path: str) -> dict | None:
     def has_cyrillic(s: str) -> bool:
         return any("\u0400" <= ch <= "\u04FF" for ch in s)
 
+    last_error = ""
     for attempt in range(2):
         temperature = 0.7 if attempt == 0 else 0.25
         final_user_prompt = user_prompt
@@ -1080,12 +1132,11 @@ async def generate_ai_caption(image_path: str) -> dict | None:
                 "\nНапоминание: нужен только русский язык. "
                 "Ответ строго из двух строк: ВЕРХ и НИЗ. Без пояснений."
             )
-        result = await groq_vision_chat(
-            system_prompt, final_user_prompt, img_base64, temperature
-        )
+        result = await groq_vision_chat(system_prompt, final_user_prompt, img_base64, temperature)
         content = result.get("content") or ""
         if not content:
-            return None
+            last_error = result.get("error") or "пустой ответ"
+            continue
         top, bottom = _extract_meme_lines(content)
         top = normalize_phrase(top)[:200]
         bottom = normalize_phrase(bottom)[:200]
@@ -1096,12 +1147,11 @@ async def generate_ai_caption(image_path: str) -> dict | None:
         if not top or not bottom:
             continue
         return {"top": top, "bottom": bottom}
+    if last_error:
+        return {"error": last_error}
     return None
 
 
-# ---------------------------------------------------------------------------
-# Мемофей: команды и обработчики
-# ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_chat:
         return
@@ -1111,10 +1161,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.clear()
         await track_user(update.effective_user.id)
         await update.effective_message.reply_text(
-            "👋 Привет! Я Memofey v7.0\n"
+            "👋 Привет! Я Memofey v8.0\n"
             "🎭 Шаблоны — случайная картинка из твоей коллекции\n"
             "🖼 Выбрать шаблон — выбор вручную\n"
             "📸 Загрузить — сделать из фото шаблон\n"
+            "🎨 Сгенерировать картинку — нарисую по описанию, можно сохранить в шаблоны\n"
             "✍️ Добавить фразу — пополнить банк надписей\n"
             "🧠 Нейросеть — ИИ посмотрит картинку и придумает надпись\n"
             "🆘 Техподдержка — связь с админом\n"
@@ -1191,11 +1242,12 @@ async def ai_generate(context, chat_id: int, ud, message) -> None:
         path = random.choice(files)
     status = await message.reply_text("🤖 Нейросеть смотрит на картинку и придумывает надпись…")
     result = await generate_ai_caption(path)
-    if not result:
+    if not result or result.get("error"):
+        reason = (result or {}).get("error") or "модель не вернула подходящий ответ"
         try:
             await status.edit_text(
-                "❌ Нейросеть недоступна или не смогла придумать надпись.\n"
-                "Проверь, что ключ Groq API указан верно и модель доступна.\n"
+                "❌ Нейросеть не смогла придумать надпись.\n"
+                f"Причина: {reason}\n"
                 f"Модель: {GROQ_VISION_MODEL}"
             )
         except TelegramError:
@@ -1212,6 +1264,66 @@ async def ai_generate(context, chat_id: int, ud, message) -> None:
     )
 
 
+async def generate_picture(context, chat_id: int, ud, message, prompt: str) -> None:
+    if ud.get("gen_busy"):
+        await message.reply_text("⏳ Предыдущая картинка ещё рисуется, подожди.")
+        return
+    ud["gen_busy"] = True
+    status = await message.reply_text(
+        "🎨 Рисую картинку…\n"
+        "Бесплатный сервис рисует по одной картинке примерно раз в минуту — может занять до пары минут."
+    )
+    try:
+        result = await pollinations_generate(prompt)
+        if not result.get("data"):
+            try:
+                await status.edit_text(
+                    f"❌ Не удалось сгенерировать картинку.\nПричина: {result.get('error')}",
+                    reply_markup=main_kb(message.from_user.id if message.from_user else chat_id),
+                )
+            except TelegramError:
+                pass
+            return
+        try:
+            path = await asyncio.to_thread(save_upload_sync, result["data"], chat_id)
+        except Exception:
+            try:
+                await status.edit_text("❌ Сервис вернул повреждённое изображение. Попробуй ещё раз.")
+            except TelegramError:
+                pass
+            return
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+        gen_id = uuid.uuid4().hex[:16]
+        gens = context.bot_data.setdefault("generated_images", LRUDict(500))
+        gens[gen_id] = path
+        buf = BytesIO(result["data"])
+        buf.name = "generated.jpg"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить в шаблоны", callback_data=f"genadd:{gen_id}")],
+            [
+                InlineKeyboardButton("🔁 Ещё вариант", callback_data=f"genagain:{gen_id}"),
+                InlineKeyboardButton("❌ Удалить", callback_data=f"gendel:{gen_id}"),
+            ],
+        ])
+        try:
+            await context.bot.send_photo(
+                chat_id, photo=buf,
+                caption=f"🎨 {prompt[:900]}\nДобавить эту картинку в шаблоны?",
+                reply_markup=kb, reply_to_message_id=message.message_id,
+            )
+        except TelegramError:
+            await message.reply_text("❌ Telegram отклонил изображение.")
+        finally:
+            buf.close()
+    finally:
+        ud.pop("gen_busy", None)
+        if ud.get("flow") == "wait_gen_prompt":
+            ud["flow"] = None
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -1224,43 +1336,41 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     async with chat_lock(context, chat.id):
         ud = context.user_data
         flow = ud.get("flow")
-
         if is_admin(user.id) and message.reply_to_message:
             target = ADMIN_REPLY_MAP.get(message.reply_to_message.message_id)
             if target:
                 await answer_support(context, message, target)
                 return
-
         if message.photo:
             if flow == "wait_upload":
                 await track_user(user.id)
                 await handle_upload(update, context)
             return
-
         text = (message.text or "").strip()
         if not text:
             if flow == "wait_upload":
                 await message.reply_text("📸 Пришли именно фото.", reply_markup=UPLOAD_KB)
             return
-
         if not is_private and flow is None and text not in GROUP_ALLOWED_TEXTS:
             return
-
         await track_user(user.id)
-
         if text in EXIT_BUTTONS:
             ud.clear()
             await message.reply_text("🏠 Главное меню:", reply_markup=main_kb(user.id))
             return
-
         if flow == "wait_upload":
             await message.reply_text("📸 Пришли именно фото.", reply_markup=UPLOAD_KB)
             return
-
         if flow == "support":
             await forward_to_admin(context, message, user)
             return
-
+        if flow == "wait_gen_prompt":
+            if len(text) > GEN_PROMPT_MAX_LEN:
+                await message.reply_text(f"⚠️ Слишком длинное описание. Максимум {GEN_PROMPT_MAX_LEN} символов.", reply_markup=GEN_KB)
+                return
+            ud["last_gen_prompt"] = text
+            await generate_picture(context, chat.id, ud, message, text)
+            return
         if flow in {"wait_top", "wait_bottom"}:
             if text in {"⬆️ Добавить верхнюю", "⬇️ Добавить нижнюю"}:
                 await message.reply_text("Пришли текст фразы.", reply_markup=PHRASE_KB)
@@ -1273,7 +1383,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             ud["flow"] = "phrase_menu"
             return
-
         if flow == "wait_broadcast":
             if not is_admin(user.id):
                 ud.clear()
@@ -1285,11 +1394,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             ud["flow"] = "admin"
             await message.reply_text("📢 Подтверди рассылку:\n" + text[:1500], reply_markup=CONFIRM_KB)
             return
-
         if text == "🎲 Случайная надпись":
             await random_meme(context, chat.id, ud.get("chosen_template"))
             return
-
         if text == "✍️ Своя надпись":
             ud["flow"] = "wait_text"
             await message.reply_text(
@@ -1297,35 +1404,39 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 reply_markup=CAPTION_KB,
             )
             return
-
         if text == "🧠 Нейросеть":
             await ai_generate(context, chat.id, ud, message)
             return
-
         if flow == "wait_text":
             top, bottom = parse_caption(text)
             await send_meme(context, chat.id, top, bottom, ud.get("chosen_template"), message.message_id)
             ud["flow"] = "caption"
             return
-
         if text == "🎭 Шаблоны":
             ud["flow"] = "caption"
             ud.pop("chosen_template", None)
             await message.reply_text("🎲 Какую надпись поставить?\n" + CAPTION_HELP, reply_markup=CAPTION_KB)
             return
-
         if text == "🖼 Выбрать шаблон":
             ud["flow"] = "pick"
             await show_template_page(context, chat.id, "pick", 0)
             return
-
         if text == "📸 Загрузить":
             ud["flow"] = "wait_upload"
             await message.reply_text(
                 "📸 Пришли фото — оно станет шаблоном.\nОтмена: «◀️ Назад».", reply_markup=UPLOAD_KB,
             )
             return
-
+        if text == "🎨 Сгенерировать картинку":
+            ud["flow"] = "wait_gen_prompt"
+            await message.reply_text(
+                "🎨 Опиши, что нарисовать.\n"
+                "Например: «рыжий кот за офисным столом с ноутбуком, смешное фото».\n"
+                "Можно писать по-русски или по-английски.\n"
+                "Отмена: «◀️ Назад».",
+                reply_markup=GEN_KB,
+            )
+            return
         if text == "🆘 Техподдержка":
             ud["flow"] = "support"
             try:
@@ -1334,47 +1445,38 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 pass
             await message.reply_text("🛠 Режим поддержки. Пиши вопрос — он уйдёт админу.", reply_markup=SUPPORT_KB)
             return
-
         if text == "✍️ Добавить фразу":
             ud["flow"] = "phrase_menu"
             await message.reply_text("✍️ Что добавляем?", reply_markup=PHRASE_KB)
             return
-
         if text == "⬆️ Добавить верхнюю":
             ud["flow"] = "wait_top"
             await message.reply_text("⬆️ Пришли ВЕРХНЮЮ фразу:", reply_markup=PHRASE_KB)
             return
-
         if text == "⬇️ Добавить нижнюю":
             ud["flow"] = "wait_bottom"
             await message.reply_text("⬇️ Пришли НИЖНЮЮ фразу:", reply_markup=PHRASE_KB)
             return
-
         if not is_admin(user.id):
             if is_private:
                 await message.reply_text("ℹ️ Используй кнопки меню или /start.", reply_markup=main_kb(user.id))
             return
-
         if text == "🛠 Админка":
             ud["flow"] = "admin"
             await message.reply_text("🛠 Админ-панель:", reply_markup=ADMIN_KB)
             return
-
         if text == "🗑 Удалить шаблон":
             ud["flow"] = "admin_delete"
             await show_template_page(context, chat.id, "del", 0)
             return
-
         if text == "🗑 Очистить всё":
             ud["pending"] = {"type": "clear"}
             await message.reply_text("⚠️ Удалить ВСЕ шаблоны и превью? Это необратимо.", reply_markup=CONFIRM_KB)
             return
-
         if text == "🗑 Удалить фразу":
             ud["flow"] = "phrase_admin"
             await send_phrase_menu(context, chat.id)
             return
-
         if text == "📊 Статистика":
             await message.reply_text(
                 "📊 Статистика\n"
@@ -1385,12 +1487,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 reply_markup=ADMIN_KB,
             )
             return
-
         if text == "📢 Рассылка":
             ud["flow"] = "wait_broadcast"
             await message.reply_text(f"📢 Пришли текст рассылки (до {BROADCAST_MAX_LEN} символов).", reply_markup=ADMIN_KB)
             return
-
         if is_private:
             await message.reply_text("ℹ️ Используй кнопки меню или /start.", reply_markup=main_kb(user.id))
 
@@ -1408,7 +1508,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     parts = data.split(":")
     cmd = parts[0]
     ud = context.user_data
-
     if cmd == "ai_rate" and len(parts) == 3:
         rating, meme_id = parts[1], parts[2]
         ai_data = context.bot_data.get("ai_memories", {}).pop(meme_id, None)
@@ -1425,18 +1524,52 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         await q.answer("🧠 Нейросеть запомнила твою оценку!")
         return
-
+    if cmd in {"genadd", "gendel", "genagain"} and len(parts) == 2:
+        gen_id = parts[1]
+        gens = context.bot_data.setdefault("generated_images", LRUDict(500))
+        path = gens.get(gen_id)
+        if not path or not os.path.exists(path):
+            await q.answer("Картинка устарела, сгенерируй заново.", show_alert=True)
+            return
+        if cmd == "genadd":
+            gens.pop(gen_id, None)
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await q.answer("✅ Добавлено в шаблоны!")
+            await context.bot.send_message(
+                chat_id,
+                "✅ Картинка добавлена в шаблоны. Доступна в «🎭 Шаблоны» и «🖼 Выбрать шаблон».",
+                reply_markup=main_kb(user_id),
+            )
+            return
+        if cmd == "gendel":
+            gens.pop(gen_id, None)
+            await asyncio.to_thread(delete_template_file, path)
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await q.answer("🗑 Картинка удалена.")
+            return
+        if cmd == "genagain":
+            prompt = ud.get("last_gen_prompt") or (q.message.caption or "").lstrip("🎨 ").split("\n")[0]
+            if not prompt:
+                await q.answer("Описание не найдено, отправь его заново.", show_alert=True)
+                return
+            await q.answer("🔁 Рисую новый вариант…")
+            ud["last_gen_prompt"] = prompt
+            await generate_picture(context, chat_id, ud, q.message, prompt)
+            return
     if cmd == "noop":
         await q.answer()
         return
-
     admin_cmds = {"del", "delnav", "delcancel", "ph", "phnav", "phdel", "phmenu", "clearall"}
     if cmd in admin_cmds and not is_admin(user_id):
         await q.answer("Нет доступа.", show_alert=True)
         return
-
     await q.answer()
-
     async with chat_lock(context, chat_id):
         try:
             if cmd in {"pick", "del"} and len(parts) == 3:
@@ -1461,35 +1594,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     ud["pending"] = {"type": "template", "path": path, "number": index + 1}
                     await finish_callback(q, context, f"🗑 Удалить шаблон №{index + 1}?", CONFIRM_KB)
                 return
-
             if cmd in {"picknav", "delnav"} and len(parts) == 2:
                 mode = "pick" if cmd == "picknav" else "del"
                 await show_template_page(context, chat_id, mode, int(parts[1]), q.message.message_id)
                 return
-
             if cmd in {"pickcancel", "delcancel"}:
                 ud.pop("chosen_template", None)
                 ud["flow"] = None
                 await safe_delete(context, chat_id, q.message.message_id)
                 await go_home(context, chat_id, user_id)
                 return
-
             if cmd == "phmenu":
                 await safe_delete(context, chat_id, q.message.message_id)
                 await send_phrase_menu(context, chat_id)
                 return
-
             if cmd == "ph" and len(parts) == 3:
                 kind = parts[1] if parts[1] in {"top", "bottom"} else "top"
                 text, kb = phrase_page_view(kind, int(parts[2]))
                 await finish_callback(q, context, text, kb)
                 return
-
             if cmd == "phnav" and len(parts) == 3:
                 text, kb = phrase_page_view(parts[1], int(parts[2]))
                 await finish_callback(q, context, text, kb)
                 return
-
             if cmd == "phdel" and len(parts) == 3:
                 kind = parts[1]
                 index = int(parts[2])
@@ -1501,17 +1628,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 ud["pending"] = {"type": "phrase", "kind": kind, "phrase": phrase}
                 await finish_callback(q, context, f"🗑 Удалить фразу?\n«{phrase}»", CONFIRM_KB)
                 return
-
             if cmd == "clearall":
                 ud["pending"] = {"type": "clear"}
                 await finish_callback(q, context, "⚠️ Удалить все шаблоны?", CONFIRM_KB)
                 return
-
             if cmd == "cancelconfirm":
                 ud.pop("pending", None)
                 await finish_callback(q, context, "❌ Отменено.")
                 return
-
             if cmd == "confirm":
                 pending = ud.pop("pending", None)
                 if not pending:
@@ -1540,13 +1664,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 else:
                     await finish_callback(q, context, "⚠️ Неизвестное действие.")
                 return
-
             if cmd == "home":
                 ud.clear()
                 await safe_delete(context, chat_id, q.message.message_id)
                 await go_home(context, chat_id, user_id)
                 return
-
         except (ValueError, IndexError, KeyError):
             await finish_callback(q, context, "⚠️ Некорректная кнопка. Открой меню заново.")
         except Exception:
@@ -1561,9 +1683,6 @@ async def memo_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE)
             pass
 
 
-# ---------------------------------------------------------------------------
-# Подготовка окружения
-# ---------------------------------------------------------------------------
 def remove_old_logs() -> None:
     for name in ("bot.log", "bot.log.1", "bot.log.2", "bot.log.3", "bot.log.4", "bot.log.5"):
         try:
@@ -1577,12 +1696,36 @@ def remove_old_logs() -> None:
 def prepare_environment() -> None:
     setup_dirs()
     remove_old_logs()
-    # Ollama больше не используется – ничего не запускаем.
 
 
-# ---------------------------------------------------------------------------
-# Сборка и запуск
-# ---------------------------------------------------------------------------
+async def health_handler(request):
+    from aiohttp import web
+    return web.Response(text="OK", content_type="text/plain")
+
+
+async def start_health_server() -> None:
+    port_env = os.getenv("PORT", "").strip()
+    if not port_env:
+        return
+    try:
+        port = int(port_env)
+    except ValueError:
+        return
+    from aiohttp import web
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/ping", health_handler)
+    app.router.add_head("/", health_handler)
+    app.router.add_head("/health", health_handler)
+    app.router.add_route("*", "/{tail:.*}", health_handler)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(f"✅ HTTP-сервер для UptimeRobot слушает порт {port} (пути /, /health, /ping).")
+
+
 def build_memo_app() -> Application:
     app = (
         Application.builder()
@@ -1605,6 +1748,7 @@ def build_memo_app() -> Application:
 
 async def run_all() -> None:
     await asyncio.to_thread(prepare_environment)
+    await start_health_server()
     apps = [build_memo_app()]
     initialized: list[Application] = []
     try:
